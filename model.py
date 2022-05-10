@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 def clones(module, n):
-    return [copy.deepcopy(module) for _ in range(n)]
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(n)])
 
 
 # word embedding
@@ -23,7 +23,7 @@ class WordEmbedding(nn.Module):
 
 class PositionEmbedding(nn.Module):
 
-    def __init__(self, max_len, dim=512):
+    def __init__(self, max_len=40000, dim=512, dropout=0.1):
         super(PositionEmbedding, self).__init__()
 
         pos_mat = torch.zeros((max_len, dim))
@@ -32,12 +32,13 @@ class PositionEmbedding(nn.Module):
         div_item = 1 / torch.pow(10000, torch.arange(0, dim, 2) / dim)
         pos_mat[:, 0::2] = torch.sin(pos * div_item)
         pos_mat[:, 1::2] = torch.cos(pos * div_item)
-
         pos_mat = pos_mat.unsqueeze(0)
         self.register_buffer('pos_mat', pos_mat)
 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
-        return x + self.pos_mat
+        return self.dropout(x + self.pos_mat[:, :x.size(1)])
 
 
 def attention(Q, K, V, mask):
@@ -109,16 +110,16 @@ class EncoderLayer(nn.Module):
         super(EncoderLayer, self).__init__()
 
         self.multi_head_attn = multi_atten
-        self.LayerNorm = LayerNorm
+        self.LayerNorms = clones(LayerNorm, 2)
+        self.dropouts = clones(nn.Dropout(dropout), 2)
         self.feed_forward = feed_foward
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask):
 
         out = self.multi_head_attn(x, x, x, mask)
-        out = self.dropout(out)
-        out = self.LayerNorm(out + x)
-        output = self.LayerNorm(out + self.dropout(self.feed_forward(out)))
+        out = self.dropouts[0](out)
+        out = self.LayerNorms[0](out + x)
+        output = self.LayerNorms[1](out + self.dropouts[1](self.feed_forward(out)))
         return output
 
 
@@ -136,9 +137,90 @@ class Encoder(nn.Module):
         return x
 
 
-def build_transformer(src_max_len, tgt_max_len, N=6, h=8, d_model=512, dropout=0.1):
-    model = []
+class DecoderLayer(nn.Module):
 
+    def __init__(self, multi_attn, feed_foward, LayerNorm, dropout=0.1):
+        super(DecoderLayer, self).__init__()
+
+        self.multi_attns = clones(multi_attn, 2)
+        self.feed_foward = feed_foward
+        self.LayerNorms = clones(LayerNorm, 3)
+        self.dropouts = clones(nn.Dropout(dropout), 3)
+
+    def forward(self, x, memory, mask, tgt_mask):
+        out = self.multi_attns[0](x, x, x, tgt_mask)
+        out = self.LayerNorms[0](self.dropouts[0](out) + x)
+
+        intra_out = self.multi_attns[1](x, memory, memory, mask)
+        intra_out = self.LayerNorms[1](self.dropouts[1](intra_out) + out)
+
+        feed_out = self.LayerNorms[2](self.dropouts[2](self.feed_foward(intra_out)) + intra_out)
+        return feed_out
+
+
+class Decoder(nn.Module):
+
+    def __init__(self, decoder_layer, N=6):
+        super(Decoder, self).__init__()
+
+        self.decoder_layer = clones(decoder_layer, N)
+
+    def forward(self, x, memory, mask, tgt_mask):
+        for layer in self.decoder_layer:
+            x = layer(x, memory, mask, tgt_mask)
+        return x
+
+
+class Generator(nn.Module):
+
+    def __init__(self, vocab, dim=512):
+        super(Generator, self).__init__()
+
+        self.Linear = nn.Linear(dim, vocab)
+
+    def forward(self, x):
+        return F.log_softmax(self.Linear(x), dim=-1)
+
+
+class EncoderDecoder(nn.Module):
+
+    def __init__(self, encoder, decoder, src_embed, tgt_embed, pos_embed, generator):
+        super(EncoderDecoder, self).__init__()
+
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embed = src_embed
+        self.tgt_embed = tgt_embed
+        self.generator = generator
+        self.pos_embeds = clones(pos_embed, 2)
+
+    def forward(self, src, tgt, src_mask, tgt_mask):
+        encoder_out = self.encoder(self.pos_embeds[0](self.src_embed(src)), src_mask)
+        decoder_out = self.decoder(self.pos_embeds[1](self.tgt_embed(tgt)), encoder_out, src_mask, tgt_mask)
+
+        output = self.generator(decoder_out)
+        return output
+
+
+def build_transformer(src_vocab, tgt_vocab, N=6, h=8, d_model=512, dropout=0.1):
+    # model = []
+
+    model = EncoderDecoder(
+        Encoder(EncoderLayer(MultiHeadAttention(H=h, dim=d_model),
+                             FeedFoward(dim=d_model), LayerNorm(dim=d_model), dropout=dropout), N=N),
+        Decoder(DecoderLayer(MultiHeadAttention(H=h, dim=d_model),
+                             FeedFoward(dim=d_model), LayerNorm(dim=d_model), dropout=dropout), N=N),
+        src_embed=WordEmbedding(src_vocab, dim=d_model), tgt_embed=WordEmbedding(tgt_vocab, dim=d_model),
+        pos_embed=PositionEmbedding(dim=d_model, dropout=dropout),
+        generator=Generator(tgt_vocab, dim=d_model)
+    )
+
+    # 模型初始化工作
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p)
+
+    """
     # 输入数据准备工作
     batch_input = torch.tensor([2, 3, 4])
     seq_max_len = max(batch_input)
@@ -146,7 +228,6 @@ def build_transformer(src_max_len, tgt_max_len, N=6, h=8, d_model=512, dropout=0
     # inp : bt x seq_max_len
     inp = torch.cat([F.pad(torch.randint(1, 6, (seq_len,)).reshape(1, -1), (0, seq_max_len - seq_len, 0, 0))
                      for seq_len in batch_input])
-    # mask = inp > 0
     mask = torch.bmm(inp.unsqueeze(2), inp.unsqueeze(2).transpose(1, 2)) > 0
 
     # 模型搭建
@@ -159,14 +240,17 @@ def build_transformer(src_max_len, tgt_max_len, N=6, h=8, d_model=512, dropout=0
     embed_pos_inp = pos_embed(word_embed(inp))
     encoder_out = encoder(embed_pos_inp, mask)
 
+    print(encoder_out)
     print(encoder_out.shape)
+    """
     return model
 
 
 def main():
-    src_max_len = 10
-    tgt_max_len = 10
-    model = build_transformer(src_max_len, tgt_max_len)
+    src_vocab = 10
+    tgt_vocab = 10
+    model = build_transformer(src_vocab, tgt_vocab, 2)
+    print(model)
 
 
 if __name__ == '__main__':
