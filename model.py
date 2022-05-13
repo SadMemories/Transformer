@@ -36,30 +36,33 @@ class PositionEmbedding(nn.Module):
         self.register_buffer('pos_mat', pos_mat)
 
         self.dropout = nn.Dropout(dropout)
+        self.LayerNorm = LayerNorm(dim=dim)
 
     def forward(self, x):
-        return self.dropout(x + self.pos_mat[:, :x.size(1)])
+        return self.LayerNorm(self.dropout(x + self.pos_mat[:, :x.size(1)]))
 
 
-def attention(Q, K, V, mask):
+def attention(Q, K, V, mask, dropout):
 
     dim = Q.shape[-1]
     score = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(dim)
-    mask_score = score.masked_fill(mask, -1e9)
-    soft_score = F.softmax(mask_score, -1)
+    mask_score = score.masked_fill(mask == 0, -1e9)
+    soft_score = dropout(F.softmax(mask_score, -1))
     return torch.matmul(soft_score, V)
 
 
 class MultiHeadAttention(nn.Module):
 
-    def __init__(self, H, dim=512):
+    def __init__(self, H, dim=512, dropout=0.1):
         super(MultiHeadAttention, self).__init__()
 
         assert dim % H == 0, "Dimension is not divisible"
 
         self.each_head_dim = dim // H
+        self.dropout = dropout
         self.H = H
         self.Linears = clones(nn.Linear(dim, dim), 4)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, Q, K, V, mask):  # mask: bt x seq_n x seq_n
 
@@ -67,7 +70,7 @@ class MultiHeadAttention(nn.Module):
         batch = Q.shape[0]
         query, key, value = [linear(x).view(batch, -1, self.H, self.each_head_dim).transpose(1, 2)
                              for linear, x in zip(self.Linears, (Q, K, V))]
-        x = attention(query, key, value, mask)
+        x = attention(query, key, value, mask, self.dropout)
 
         x = x.transpose(1, 2).contiguous().view(batch, -1, self.H * self.each_head_dim)
 
@@ -151,7 +154,7 @@ class DecoderLayer(nn.Module):
         out = self.multi_attns[0](x, x, x, tgt_mask)
         out = self.LayerNorms[0](self.dropouts[0](out) + x)
 
-        intra_out = self.multi_attns[1](x, memory, memory, mask)
+        intra_out = self.multi_attns[1](out, memory, memory, mask)
         intra_out = self.LayerNorms[1](self.dropouts[1](intra_out) + out)
 
         feed_out = self.LayerNorms[2](self.dropouts[2](self.feed_foward(intra_out)) + intra_out)
@@ -184,9 +187,10 @@ class Generator(nn.Module):
 
 class EncoderDecoder(nn.Module):
 
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, pos_embed, generator):
+    def __init__(self, encoder, decoder, src_embed, tgt_embed, pos_embed, generator, dim=512):
         super(EncoderDecoder, self).__init__()
 
+        self.d_model = dim
         self.encoder = encoder
         self.decoder = decoder
         self.src_embed = src_embed
@@ -206,19 +210,25 @@ def build_transformer(src_vocab, tgt_vocab, N=6, h=8, d_model=512, dropout=0.1):
     # model = []
 
     model = EncoderDecoder(
-        Encoder(EncoderLayer(MultiHeadAttention(H=h, dim=d_model),
+        Encoder(EncoderLayer(MultiHeadAttention(H=h, dim=d_model, dropout=dropout),
                              FeedFoward(dim=d_model), LayerNorm(dim=d_model), dropout=dropout), N=N),
-        Decoder(DecoderLayer(MultiHeadAttention(H=h, dim=d_model),
+        Decoder(DecoderLayer(MultiHeadAttention(H=h, dim=d_model, dropout=dropout),
                              FeedFoward(dim=d_model), LayerNorm(dim=d_model), dropout=dropout), N=N),
         src_embed=WordEmbedding(src_vocab, dim=d_model), tgt_embed=WordEmbedding(tgt_vocab, dim=d_model),
         pos_embed=PositionEmbedding(dim=d_model, dropout=dropout),
-        generator=Generator(tgt_vocab, dim=d_model)
+        generator=Generator(tgt_vocab, dim=d_model), dim=d_model
     )
 
     # 模型初始化工作
     for p in model.parameters():
         if p.dim() > 1:
             nn.init.xavier_uniform_(p)
+
+    '''
+    # Encoder和Decoder的nn.Embedding在初始化时共享同一个权重 在实际中使用下面的权重共享会令训练变慢
+    model.src_embed.embedding.weight = model.tgt_embed.embedding.weight
+    model.generator.Linear.weight = model.tgt_embed.embedding.weight
+    '''
 
     """
     # 输入数据准备工作
